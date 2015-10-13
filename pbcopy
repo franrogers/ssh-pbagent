@@ -1,0 +1,55 @@
+#!/usr/bin/env python
+
+from __future__ import print_function
+
+import os
+import socket
+import subprocess
+import sys
+
+
+def ssh_pbcopy(contents, args=[]):
+    cmd = ' '.join(['pbcopy'] + args)
+
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(os.environ['SSH_AUTH_SOCK'])
+        s.send('PBAG {0}\n{1}\n'.format(cmd, len(contents)))
+        s.send(contents)
+        f = s.makefile()
+        size = int(f.readline())
+        returncode = int(f.readline())
+        s.close()
+
+        return returncode
+    except:
+        raise IOError("error communicating with ssh-pbagent")
+
+
+if __name__ == '__main__':
+    contents = sys.stdin.read()
+
+    if 'SSH_AUTH_SOCK' in os.environ:
+        try:
+            sys.exit(ssh_pbcopy(contents, sys.argv[1:]))
+        except IOError:
+            pass
+
+    real_pbcopy = '/usr/bin/pbcopy'
+    if os.path.isfile(real_pbcopy) and os.access(real_pbcopy, os.X_OK):
+        pbcopy = subprocess.Popen([real_pbcopy] + sys.argv,
+                                  stdin=subprocess.PIPE)
+        pbcopy.stdin.write(contents)
+        pbcopy.stdin.close()
+        pbcopy.wait()
+        sys.exit(pbcopy.returncode)
+
+    try:
+        os.umask(0o077)
+        f = file(os.path.expanduser('~/.pbcontents'), 'w')
+        f.write(contents)
+        f.close()
+
+        sys.exit(0)
+    except:
+        sys.exit(1)

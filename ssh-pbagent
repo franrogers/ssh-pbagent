@@ -1,0 +1,348 @@
+#!/usr/bin/env python
+
+from __future__ import print_function
+from argparse import ArgumentParser
+import asyncore
+import os
+from signal import SIGTERM
+import socket
+import subprocess
+import sys
+from tempfile import gettempdir
+
+
+class SSHAgentWrapperHandler(asyncore.dispatcher):
+    def __init__(self, conn, initial_read=None, debug=False):
+        self.debug = debug
+        asyncore.dispatcher.__init__(self, conn)
+        self.initial_read = initial_read
+        if initial_read:
+            self.handle_read()
+
+    def recv(self, bufsize, flags=0):
+        if self.initial_read:
+            read = self.initial_read[:bufsize]
+            self.initial_read = self.initial_read[bufsize:]
+            return read
+        else:
+            return asyncore.dispatcher.recv(self, bufsize)
+
+
+class SSHAgentWrapper(asyncore.dispatcher):
+    class Receiver(asyncore.dispatcher):
+        def __init__(self, conn, handler_class, debug=False):
+            self.debug = debug
+            self.handler_class = handler_class
+
+            asyncore.dispatcher.__init__(self, conn)
+            self.from_remote_buffer = ''
+            self.to_remote_buffer = ''
+            self.sender = None
+            if self.debug:
+                print("{0}: new connection".format(self.socket.fileno()),
+                      file=sys.stderr)
+
+        def handle_connect(self):
+            pass
+
+        def handle_read(self):
+            try:
+                read = self.recv(4096)
+                if self.debug:
+                    print("{0}: read {1} bytes"
+                          .format(self.socket.fileno(), len(read)),
+                          file=sys.stderr)
+                if (self.handler_class and
+                        read.startswith(self.handler_class.escape)):
+                    read = read[len(self.handler_class.escape):]
+                    if self.debug:
+                        print("{0}: detected escape sequence '{1}'"
+                              .format(self.socket.fileno(),
+                                      self.handler_class.escape),
+                              file=sys.stderr)
+                    self.del_channel()
+                    handler = self.handler_class(self.socket,
+                                                 initial_read=read,
+                                                 debug=self.debug)
+                    return
+
+                if self.debug:
+                    print("{0}: passing along to agent"
+                          .format(self.socket.fileno()),
+                          file=sys.stderr)
+                self.from_remote_buffer += read
+            except socket.error as e:
+                if self.debug:
+                    print("error: '{0}'".format(e), file=sys.stderr)
+
+        def writable(self):
+            return (len(self.to_remote_buffer) > 0)
+
+        def handle_write(self):
+            sent = self.send(self.to_remote_buffer)
+            self.to_remote_buffer = self.to_remote_buffer[sent:]
+
+        def handle_close(self):
+            self.close()
+            if self.sender:
+                self.sender.close()
+
+    class Sender(asyncore.dispatcher):
+        def __init__(self, receiver, remoteaddr, debug=False):
+            self.debug = debug
+            asyncore.dispatcher.__init__(self)
+            self.receiver = receiver
+            receiver.sender = self
+            self.create_socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.connect(remoteaddr)
+
+        def handle_connect(self):
+            pass
+
+        def handle_read(self):
+            read = self.recv(4096)
+            self.receiver.to_remote_buffer += read
+
+        def writable(self):
+            return (len(self.receiver.from_remote_buffer) > 0)
+
+        def handle_write(self):
+            sent = self.send(self.receiver.from_remote_buffer)
+            self.receiver.from_remote_buffer = \
+                self.receiver.from_remote_buffer[sent:]
+
+        def handle_close(self):
+            self.close()
+            self.receiver.close()
+
+    @staticmethod
+    def main(handler_class, id_, name, description):
+        env_pid = 'SSH_{0}_PID'.format(id_.upper())
+        env_real = 'SSH_{0}_REALSOCK'.format(id_.upper())
+
+        parser = ArgumentParser(description=description)
+        parser.add_argument('command', type=str, nargs='?',
+                            help=("If given, run command as a subprocess. " +
+                                  "When the command dies, so does the agent."))
+        parser.add_argument('args', type=str, nargs='*',
+                            help=("Arguments for the command."))
+        parser.add_argument('-a', dest='bind_address', type=str,
+                            help=("Bind the agent to Unix domain socket " +
+                                  "BIND_ADDRESS."))
+        parser.add_argument('-c', dest='c_shell', action='store_true',
+                            default=False,
+                            help=("Generate C shell commands on stdout."))
+        parser.add_argument('-D', dest='foreground', action='store_true',
+                            default=False,
+                            help=("Foreground mode: don't fork to the " +
+                                  "background."))
+        parser.add_argument('-d', dest='debug', action='store_true',
+                            default=False,
+                            help=("Debug mode; don't fork and write " +
+                                  "debug information to standard error."))
+        parser.add_argument('-k', dest='kill', action='store_true',
+                            default=False,
+                            help=("Kill the current {0} (given by {1})."
+                                  .format(name[0].lower() + name[1:],
+                                          env_pid)))
+        parser.add_argument('-s', dest='c_shell', action='store_false',
+                            default=False,
+                            help=("Generate Bourne shell commands on " +
+                                  "stdout."))
+        args = parser.parse_args()
+
+        if args.kill:
+            pid = os.getenv(env_pid)
+            if pid:
+                os.kill(pid, SIGTERM)
+                sys.exit(0)
+            else:
+                print("${0} not set, cannot kill agent".format(env_pid),
+                      file=sys.stderr)
+                sys.exit(1)
+
+        ssh_auth_sock = os.getenv('SSH_AUTH_SOCK')
+        if args.debug:
+            print("{0}={1}".format(env_real, ssh_auth_sock), file=sys.stderr)
+
+        if args.bind_address:
+            listenaddr = args.bind_address
+        else:
+            listenaddr = os.path.join(os.path.dirname(ssh_auth_sock)
+                                      if ssh_auth_sock else
+                                      gettempdir(),
+                                      '{0}.{1}'.format(id_, os.getpid()))
+        if args.debug:
+            print("SSH_AUTH_SOCK={0}".format(listenaddr), file=sys.stderr)
+
+        child_pid = 0 if args.foreground or args.debug else os.fork()
+        if child_pid:
+            if args.command:
+                os.environ['SSH_AUTH_SOCK'] = listenaddr
+                os.environ[env_real] = ssh_auth_sock
+                os.environ[env_pid] = str(child_pid)
+
+                subprocess.call([args.command] + args.args)
+
+                os.kill(child_pid, SIGTERM)
+                sys.exit(0)
+            elif args.c_shell:
+                print(('setenv SSH_AUTH_SOCK {0};\n' +
+                       ('setenv {1} {2};\n'
+                        if ssh_auth_sock else '') +
+                       'setenv {3} {4};\n' +
+                       'echo {5} pid {4});')
+                      .format(listenaddr, env_real, ssh_auth_sock,
+                              env_pid, child_pid, name))
+                sys.exit(0)
+            else:
+                print(('SSH_AUTH_SOCK="{0}"; export SSH_AUTH_SOCK;\n' +
+                       (('{1}="{2}"; ' +
+                         'export {1};\n')
+                        if ssh_auth_sock else '') +
+                       '{3}={4}; {3};\n' +
+                       'echo {5} pid {4};')
+                      .format(listenaddr, env_real, ssh_auth_sock,
+                              env_pid, child_pid, name))
+                sys.exit(0)
+
+        try:
+            os.unlink(listenaddr)
+        except OSError:
+            if os.path.exists(listenaddr):
+                raise
+
+        dispatcher = SSHAgentWrapper(listenaddr,
+                                     ssh_auth_sock,
+                                     handler_class,
+                                     debug=args.debug)
+
+        try:
+            asyncore.loop()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            os.unlink(listenaddr)
+            sys.exit(0)
+
+    def __init__(self, listenaddr, agentaddr, handler_class,
+                 backlog=5, debug=False):
+        self.debug = debug
+        asyncore.dispatcher.__init__(self)
+        self.agentaddr = agentaddr
+        self.create_socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.set_reuse_addr()
+        self.bind(listenaddr)
+        self.listen(backlog)
+        self.handler_class = handler_class
+
+    def handle_accept(self):
+        conn, addr = self.accept()
+        sender = self.Sender(self.Receiver(conn,
+                                           self.handler_class,
+                                           self.debug),
+                             self.agentaddr,
+                             debug=self.debug)
+
+
+class SSHPasteboardAgentHandler(SSHAgentWrapperHandler):
+    escape = "PBAG "
+
+    def handle_read(self):
+        try:
+            read = self.recv(4096)
+
+            if not hasattr(self, 'cmd'):
+                if not hasattr(self, 'buffer'):
+                    self.buffer = ''
+                self.buffer += read
+                lfindex = self.buffer.find('\n')
+                if lfindex < 0:
+                    return
+                self.cmd = self.buffer[:lfindex + 1].split()
+                read = self.buffer[lfindex + 1:]
+                self.buffer = ''
+                if self.debug:
+                    print("{0}: got command: {1}"
+                          .format(self.socket.fileno(),
+                                  ' '.join(self.cmd)),
+                          file=sys.stderr)
+
+            if self.cmd[0] == 'pbcopy':
+                if not hasattr(self, 'copy_size'):
+                    self.buffer += read
+                    lfindex = self.buffer.find('\n')
+                    if lfindex < 0:
+                        return
+                    self.copy_size = int(self.buffer[:lfindex])
+                    read = self.buffer[lfindex + 1:]
+
+                    DEVNULL = open(os.devnull, 'wb')
+                    self.pbcopy = subprocess.Popen(self.cmd,
+                                                   stdin=subprocess.PIPE,
+                                                   stderr=DEVNULL)
+                    self.pbcopy_pipe = self.pbcopy.stdin
+                    self.copied = 0
+
+                self.pbcopy_pipe.write(read[:self.copy_size - self.copied])
+                self.copied += len(read[:self.copy_size - self.copied])
+
+                if self.debug:
+                    print("{0}: read {1}/{2} bytes"
+                          .format(self.socket.fileno(),
+                                  self.copied,
+                                  self.copy_size),
+                          file=sys.stderr)
+                if self.copied == self.copy_size:
+                    self.socket.send('{0}\n'.format(self.copied))
+                    self.pbcopy_pipe.close()
+                    self.pbcopy.wait()
+                    if self.debug:
+                        print("{0}: pbcopy return code {1}"
+                              .format(self.socket.fileno(),
+                                      self.pbcopy.returncode),
+                              file=sys.stderr)
+                    self.socket.send('{0}\n'.format(self.pbcopy.returncode))
+                    if self.debug:
+                        print("{0}: finished; closing socket"
+                              .format(self.socket.fileno()),
+                              file=sys.stderr)
+                    self.close()
+            elif self.cmd[0] == 'pbpaste':
+                DEVNULL = open(os.devnull, 'wb')
+                self.pbpaste = subprocess.Popen(self.cmd,
+                                                stdout=subprocess.PIPE,
+                                                stderr=DEVNULL)
+                data = self.pbpaste.communicate()[0]
+                self.socket.send('{0}\n'.format(len(data)))
+                if self.debug:
+                    print(("{0}: sending {1} bytes\n{0}: " +
+                           "pbpaste return code {2}")
+                          .format(self.socket.fileno(),
+                                  len(data),
+                                  self.pbpaste.returncode),
+                          file=sys.stderr)
+                self.socket.send(data)
+                self.socket.send('\n{0}\n'.format(self.pbpaste.returncode))
+                if self.debug:
+                    print("{0}: finished; closing socket"
+                          .format(self.socket.fileno()),
+                          file=sys.stderr)
+                self.close()
+            else:
+                if self.debug:
+                    print("{0}: unknown command; closing socket"
+                          .format(self.socket.fileno()),
+                          file=sys.stderr)
+                self.close()
+        except IOError as e:
+            if self.debug:
+                print("error: '{0}'", e, file=sys.stderr)
+
+
+if __name__ == '__main__':
+    SSHAgentWrapper.main(SSHPasteboardAgentHandler,
+                         'pbagent',
+                         "Pasteboard agent",
+                         "Forwards your local clipboard through " +
+                         "SSH agent forwarding.")

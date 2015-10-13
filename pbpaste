@@ -1,0 +1,50 @@
+#!/usr/bin/env python
+
+from __future__ import print_function
+
+import os
+import socket
+import subprocess
+import sys
+
+
+def ssh_pbpaste(args=[]):
+    cmd = ' '.join(['pbpaste'] + args)
+
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(os.environ['SSH_AUTH_SOCK'])
+        s.send('PBAG {0}\n'.format(cmd))
+        f = s.makefile()
+        size = int(f.readline())
+        contents = f.read(size)
+        f.read(1)
+        returncode = int(f.readline())
+        s.close()
+
+        return contents, returncode
+    except:
+        raise IOError("error communicating with ssh-pbagent")
+
+
+if __name__ == '__main__':
+    if 'SSH_AUTH_SOCK' in os.environ:
+        try:
+            contents, returncode = ssh_pbpaste(sys.argv[1:])
+            sys.stdout.write(contents)
+            sys.exit(returncode)
+        except IOError:
+            pass
+
+    real_pbpaste = '/usr/bin/pbpaste'
+    if os.path.isfile(real_pbpaste) and os.access(real_pbpaste, os.X_OK):
+        os.execl(real_pbpaste, real_pbpaste, *sys.argv)
+
+    try:
+        f = file(os.path.expanduser('~/.pbcontents'), 'r')
+        sys.stdout.write(f.read())
+        f.close()
+
+        sys.exit(0)
+    except:
+        sys.exit(1)
