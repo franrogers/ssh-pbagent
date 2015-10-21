@@ -212,6 +212,10 @@ class SSHAgentWrapper(asyncore.dispatcher):
             if os.path.exists(listenaddr):
                 raise
 
+        os.close(0)
+        os.close(1)
+        os.close(2)
+
         dispatcher = SSHAgentWrapper(listenaddr,
                                      ssh_auth_sock,
                                      handler_class,
@@ -223,7 +227,7 @@ class SSHAgentWrapper(asyncore.dispatcher):
             pass
         finally:
             os.unlink(listenaddr)
-            sys.exit(0)
+            os._exit(0)
 
     def __init__(self, listenaddr, agentaddr, handler_class,
                  backlog=5, debug=False):
